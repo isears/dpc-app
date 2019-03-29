@@ -8,11 +8,14 @@ import gov.cms.dpc.common.models.JobModel;
 import gov.cms.dpc.queue.JobQueue;
 import gov.cms.dpc.queue.JobStatus;
 import gov.cms.dpc.queue.Pair;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
+import io.github.resilience4j.retry.transformer.RetryTransformer;
+import io.reactivex.Observable;
+import io.reactivex.schedulers.Schedulers;
+import org.hl7.fhir.dstu3.model.Patient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import rx.Observable;
-import rx.observables.BlockingObservable;
-import rx.schedulers.Schedulers;
 
 import javax.inject.Inject;
 import java.io.FileOutputStream;
@@ -39,7 +42,6 @@ public class AggregationEngine implements Runnable {
         this.bbclient = bbclient;
         this.context = FhirContext.forDstu3();
         this.exportPath = config.getString("exportPath");
-        logger.error("Creating!!!");
     }
 
     @Override
@@ -88,18 +90,14 @@ public class AggregationEngine implements Runnable {
 
     void workJob(UUID jobID, JobModel job) throws IOException {
         final IParser parser = context.newJsonParser();
-        logger.error("Working");
         try (final FileOutputStream writer = new FileOutputStream(String.format("%s/%s.ndjson", exportPath, jobID.toString()))) {
 
             // Map over the patients and fetch them using a separate thread pool
-            final BlockingObservable<String> stringBlockingObservable = Observable.from(job.getPatients())
+            Observable.fromIterable(job.getPatients())
                     .flatMap((patient) -> this.handlePatient(patient, parser))
                     .subscribeOn(Schedulers.io())
-                    .toBlocking();
-
-
-            stringBlockingObservable
-                    .forEach(str -> {
+                    .doOnError(e -> logger.error("Error: ", e))
+                    .blockingSubscribe(str -> {
                         try {
                             logger.debug("Writing {} to file on thread {}", str, Thread.currentThread().getName());
                             writer.write(str.getBytes(StandardCharsets.UTF_8));
@@ -113,10 +111,15 @@ public class AggregationEngine implements Runnable {
     }
 
     private Observable<String> handlePatient(String patient, IParser parser) {
-        return Observable
-                .just(patient)
+        // Create retry handler
+        RetryConfig config = RetryConfig.ofDefaults();
+        Retry retry = Retry.of("testName", config);
+        RetryTransformer<Patient> retryTransformer = RetryTransformer.of(retry);
+
+        return Observable.fromCallable(() -> this.bbclient.requestPatientFromServer(patient))
+                .compose(retryTransformer)
                 .doOnNext(p -> logger.debug("Fetching {} on {}", p, Thread.currentThread().getName()))
-                .map(this.bbclient::requestPatientFromServer)
                 .map(parser::encodeResourceToString);
+
     }
 }
