@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -11,6 +10,12 @@ import (
 
 	que "github.com/bgentry/que-go"
 )
+
+type testLogger struct{}
+
+func (t testLogger) Log(level pgx.LogLevel, msg string, data map[string]interface{}) {
+	log.Println(msg)
+}
 
 func crash(err error) {
 	log.Fatal(fmt.Errorf("|TIME=%s|CRASH_REASON=%v|", time.Now().UTC(), err))
@@ -27,6 +32,9 @@ func getDatabaseConnectionConfig() pgx.ConnConfig {
 	if err != nil {
 		crash(err)
 	}
+	conncfg.Logger = testLogger{}
+	conncfg.LogLevel = pgx.LogLevelTrace
+
 	return conncfg
 }
 
@@ -37,6 +45,7 @@ func GetDataBaseClient() *que.Client {
 	dbconncfg := getDatabaseConnectionConfig()
 	dbconn, err := pgx.NewConnPool(pgx.ConnPoolConfig{
 		ConnConfig: dbconncfg,
+
 		// AfterConnect: que.PrepareStatements,
 	})
 	if err != nil {
@@ -46,17 +55,15 @@ func GetDataBaseClient() *que.Client {
 }
 
 func printjob(j *que.Job) error {
-	var args []byte
-	if err := json.Unmarshal(j.Args, &args); err != nil {
-		return err
-	}
-	fmt.Printf("Hello %b!\n", args)
+	fmt.Printf("Hello %b!\n", j.Args)
 	return nil
 }
 
+// GetWorkerPool is called to setup the worker threads
+// for queueing work.
 func GetWorkerPool(cl *que.Client) *que.WorkerPool {
 	wm := que.WorkMap{"PrintJob": printjob}
-	return que.NewWorkerPool(cl, wm, 2) // create a pool w/ 2 workers
+	return que.NewWorkerPool(cl, wm, 3) // create a pool w/ 2 workers
 }
 
 // The QueueInterface is a lightweight internal
@@ -69,13 +76,16 @@ type QueueInterface struct {
 // Append is a static external call to
 // add jobs to QueueInterface
 // which routes work to a *que.Client.
-func (q QueueInterface) Append(blob []byte) (int64, error) {
+func (q QueueInterface) Append(blob []byte) int64 {
 	j := &que.Job{
 		Type: "PrintJob",
 		Args: blob,
 	}
-
-	return j.ID, q.cl.Enqueue(j)
+	runit := q.cl.Enqueue(j)
+	if runit != nil {
+		return -1
+	}
+	return j.ID
 }
 
 // Init is the setup function which generates
@@ -88,17 +98,3 @@ func Init() QueueInterface {
 		wp: workerpool,
 	}
 }
-
-// const (
-// 	var Case1 = []byte("Some Valid thing!")
-// 	var Case2 = []byte("Some other thing.")
-// )
-
-// func (q QueueInterface) TestAppend(t *testing.T) {
-
-// 	// A valid job should never fail to append (500 Error)
-// 	q.Append((Case1))
-
-// 	// An invalid job should never append successfully
-
-// }

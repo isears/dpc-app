@@ -1,12 +1,14 @@
 package main
 
 import (
+	"encoding/json"
+
 	"github.com/gin-gonic/gin"
 )
 
 // IEnqueueReq is the structure by
 // which we serialize our Job requests.
-type IEnqueueReq []byte
+type IEnqueueReq struct{ job string }
 
 // IEnqueueRes is the structure by
 // which we process our Job requests
@@ -22,15 +24,12 @@ func main() {
 	router := gin.Default()
 	router.PUT("/enqueue/:job", func(c *gin.Context) {
 		// param serializes to string so this is inefficient
-		bytesin := []byte(c.Param("job"))
-		req := IEnqueueReq(bytesin)
-		id, err := q.Append(req)
+		req, err := json.Marshal(IEnqueueReq{job: c.Param("job")})
 		if err != nil {
-			c.Error(err)
 			c.JSON(500, err.Error())
-		} else {
-			c.JSON(200, IEnqueueRes{ID: id})
 		}
+		id := q.Append(req)
+		c.JSON(200, IEnqueueRes{ID: id})
 	})
 
 	router.Run(":8080")
