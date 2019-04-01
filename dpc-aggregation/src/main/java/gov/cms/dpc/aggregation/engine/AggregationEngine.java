@@ -7,11 +7,11 @@ import gov.cms.dpc.aggregation.bbclient.BlueButtonClient;
 import gov.cms.dpc.common.models.JobModel;
 import gov.cms.dpc.queue.JobQueue;
 import gov.cms.dpc.queue.JobStatus;
-import gov.cms.dpc.queue.Pair;
 import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryConfig;
 import io.github.resilience4j.retry.transformer.RetryTransformer;
 import io.reactivex.Observable;
+import io.reactivex.disposables.Disposable;
 import io.reactivex.schedulers.Schedulers;
 import org.hl7.fhir.dstu3.model.Patient;
 import org.slf4j.Logger;
@@ -24,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 public class AggregationEngine implements Runnable {
 
@@ -35,6 +36,7 @@ public class AggregationEngine implements Runnable {
     private final FhirContext context;
     private final String exportPath;
     private volatile boolean run = true;
+    private Disposable subscribe;
 
     @Inject
     public AggregationEngine(BlueButtonClient bbclient, JobQueue queue, Config config) {
@@ -46,46 +48,76 @@ public class AggregationEngine implements Runnable {
 
     @Override
     public void run() {
-
-        while (run) {
-            this.pollQueue();
-        }
-        logger.info("Shutting down aggregation engine");
+        logger.info("Starting to poll for aggregation jobs");
+        this.pollQueue();
     }
 
     public void stop() {
         this.run = false;
+        this.subscribe.dispose();
     }
 
-    void pollQueue() {
-        final Optional<Pair<UUID, Object>> workPair = this.queue.workJob();
-        if (workPair.isEmpty()) {
-            try {
-                logger.debug("No job, waiting 2 seconds");
-                Thread.sleep(2000);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        } else {
-            final JobModel model = (JobModel) workPair.get().getRight();
-            final UUID jobID = workPair.get().getLeft();
-            logger.debug("Has job {}. Working.", jobID);
-            List<String> attributedBeneficiaries = model.getPatients();
+    private void pollQueue() {
 
-            if (!attributedBeneficiaries.isEmpty()) {
-                logger.debug("Has {} attributed beneficiaries", attributedBeneficiaries.size());
-                try {
-                    this.workJob(jobID, model);
-                    this.queue.completeJob(jobID, JobStatus.COMPLETED);
-                } catch (Exception e) {
-                    logger.error("Cannot process job {}", jobID, e);
-                    this.queue.completeJob(jobID, JobStatus.FAILED);
-                }
-            } else {
-                logger.error("Cannot execute Job {} with no beneficiaries", jobID);
-                this.queue.completeJob(jobID, JobStatus.FAILED);
-            }
-        }
+        subscribe = Observable.fromCallable(this.queue::workJob)
+                .doOnNext(job -> logger.warn("Awaiting job on {}", Thread.currentThread().getName()))
+                .filter(Optional::isPresent)
+                .repeatWhen(completed -> {
+                    logger.warn("No job, retrying in a bit");
+                    return completed.delay(2, TimeUnit.SECONDS);
+                })
+                .map(Optional::get)
+                .doOnError(error -> logger.error("Error on things: ", error))
+                .subscribe(workPair -> {
+                    final JobModel model = (JobModel) workPair.getRight();
+                    final UUID jobID = workPair.getLeft();
+                    logger.debug("Has job {}. Working.", jobID);
+                    List<String> attributedBeneficiaries = model.getPatients();
+
+                    if (!attributedBeneficiaries.isEmpty()) {
+                        logger.debug("Has {} attributed beneficiaries", attributedBeneficiaries.size());
+                        try {
+                            this.workJob(jobID, model);
+                            this.queue.completeJob(jobID, JobStatus.COMPLETED);
+                        } catch (Exception e) {
+                            logger.error("Cannot process job {}", jobID, e);
+                            this.queue.completeJob(jobID, JobStatus.FAILED);
+                        }
+                    } else {
+                        logger.error("Cannot execute Job {} with no beneficiaries", jobID);
+                        this.queue.completeJob(jobID, JobStatus.FAILED);
+                    }
+                });
+
+
+//        final Optional<Pair<UUID, Object>> workPair = this.queue.workJob();
+//        if (workPair.isEmpty()) {
+//            try {
+//                logger.debug("No job, waiting 2 seconds");
+//                Thread.sleep(2000);
+//            } catch (InterruptedException e) {
+//                e.printStackTrace();
+//            }
+//        } else {
+//            final JobModel model = (JobModel) workPair.get().getRight();
+//            final UUID jobID = workPair.get().getLeft();
+//            logger.debug("Has job {}. Working.", jobID);
+//            List<String> attributedBeneficiaries = model.getPatients();
+//
+//            if (!attributedBeneficiaries.isEmpty()) {
+//                logger.debug("Has {} attributed beneficiaries", attributedBeneficiaries.size());
+//                try {
+//                    this.workJob(jobID, model);
+//                    this.queue.completeJob(jobID, JobStatus.COMPLETED);
+//                } catch (Exception e) {
+//                    logger.error("Cannot process job {}", jobID, e);
+//                    this.queue.completeJob(jobID, JobStatus.FAILED);
+//                }
+//            } else {
+//                logger.error("Cannot execute Job {} with no beneficiaries", jobID);
+//                this.queue.completeJob(jobID, JobStatus.FAILED);
+//            }
+//        }
     }
 
     void workJob(UUID jobID, JobModel job) throws IOException {
